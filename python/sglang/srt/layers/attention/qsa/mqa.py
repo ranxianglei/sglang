@@ -394,7 +394,10 @@ def qsa_mqa_prefill(
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        try:
+            return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        except Exception:
+            globals()["HAS_TILELANG"] = False
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 

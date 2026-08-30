@@ -164,5 +164,8 @@ class Qwen3ASRConfig(PretrainedConfig):
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+for _name, _cls in (("qwen3_asr", Qwen3ASRConfig), ("qwen3_asr_thinker", Qwen3ASRThinkerConfig)):
+    try:
+        AutoConfig.register(_name, _cls)
+    except ValueError:
+        pass

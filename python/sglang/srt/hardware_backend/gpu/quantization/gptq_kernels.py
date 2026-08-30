@@ -339,7 +339,7 @@ class GPTQMarlinMoEKernel:
             size_k=layer.intermediate_size_per_partition,
             size_n=layer.w13_scales.shape[2],
             group_size=self.quant_config.group_size,
-        )
+        ).to(torch.bfloat16)
         replace_parameter(layer, "w13_scales", marlin_w13_scales)
         marlin_w2_scales = marlin_moe_permute_scales(
             s=layer.w2_scales,
@@ -351,8 +351,26 @@ class GPTQMarlinMoEKernel:
             ),
             size_n=layer.w2_scales.shape[2],
             group_size=self.quant_config.group_size,
-        )
+        ).to(torch.bfloat16)
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
+        # [W4A16-PATCH] Free the swapped-out int32 GPTQ weights eagerly.
+        # On Qwen3.8-Flash-Next W4A16 (512 experts), the loader materializes
+        # all layers as int32-packed tensors (~56 GiB). Without eager GC the
+        # old tensors linger (reference cycles), and marlin outputs accumulate
+        # +0.58 GiB/layer -> OOM at ~layer 40 of 48.
+        import gc as _gc
+
+        _gc.collect()
+        torch.cuda.empty_cache()
+        GPTQMarlinMoEKernel._repack_n = getattr(
+            GPTQMarlinMoEKernel, "_repack_n", 0
+        ) + 1
+        if GPTQMarlinMoEKernel._repack_n % 8 == 1:
+            print(
+                f"[REPACK-FREE #{GPTQMarlinMoEKernel._repack_n}] "
+                f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.2f} GiB",
+                flush=True,
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

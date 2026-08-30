@@ -55,7 +55,7 @@ def _resolve_trtllm_sparse_decode():
     """
     from sglang.srt.utils import is_sm100_supported, is_sm121
 
-    if not (is_sm100_supported() or is_sm121()):
+    if not (is_sm100_supported() or is_sm121() or torch.cuda.get_device_capability() == (12, 0)):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
