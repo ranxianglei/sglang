@@ -498,6 +498,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         compress_ratio,
         row_token_starts=None,
         prefix_lens=None,
+        member_from_ring=None,
     ):
         """Compressed-write plan for one forward, computed entirely on device.
 
@@ -540,12 +541,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Group members as token-row indices into this forward's packed
             # tensors: the chunk is group-aligned, so the group's first
             # member sits chunk-locally at (block * ratio - prefix).
+            # Mixed-chunk decode rows are marked with -1: their group's
+            # members live in the pending ring, not in this chunk.
+            direct = (
+                torch.ones_like(valid)
+                if member_from_ring is None
+                else ~member_from_ring[rows]
+            )
             member_rows = torch.where(
-                valid,
+                valid & direct,
                 row_token_starts[rows]
                 + blocks * compress_ratio
                 - prefix_lens[rows],
-                torch.zeros_like(blocks),
+                torch.where(
+                    valid,
+                    torch.full_like(blocks, -1),
+                    torch.zeros_like(blocks),
+                ),
             )
         return write_locs, group_end_positions, rows, member_rows
 
@@ -582,22 +594,36 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise ValueError("QSA extend write plan requires extend_seq_lens")
         extend_lens = extend_lens.long()[: lengths.numel()]
         prefix_lens = (lengths - extend_lens).clamp_min(0)
+        # Mixed-chunk batches fold running decode requests into the extend
+        # batch as one-token rows. A decode row's prefix is its own
+        # continuous KV (token-granular, not page-granular), so the
+        # page-alignment invariant below only holds for true prefill rows.
+        # Those rows fall back to the paged semantics instead: they complete
+        # at most the block their new token closes, sourcing members from
+        # the pending ring (see the mixed path in the metadata builder).
+        is_dec_row = forward_batch.forward_mode.is_mixed() & (extend_lens == 1)
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        torch._assert_async(((prefix_lens % ratio == 0) | is_dec_row).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
         row_token_starts = torch.cumsum(extend_lens, 0) - extend_lens
+        start_blocks = torch.where(
+            is_dec_row,
+            end_blocks - (lengths % ratio == 0).long(),
+            prefix_lens // ratio,
+        )
         return self._qsa_write_plan(
             token_slot_table=token_slot_table,
-            start_blocks=prefix_lens // ratio,
+            start_blocks=start_blocks,
             end_blocks=end_blocks,
             capacity=capacity,
             compress_ratio=ratio,
             row_token_starts=row_token_starts,
             prefix_lens=prefix_lens,
+            member_from_ring=is_dec_row,
         )
 
     def _metadata_from_forward_batch(self, forward_batch) -> QwenSparseAttnMetadata:
@@ -733,6 +759,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             )
             decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
+            mixed_dec_rows = None
+            if forward_batch.forward_mode.is_mixed():
+                mixed_dec_rows = (
+                    forward_batch.extend_seq_lens[: sequence_lengths.numel()] == 1
+                )
             if decode_like:
                 decode_logical_positions = (
                     logical_positions.to(torch.int32)
@@ -763,6 +794,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     logical_positions=ring_logical_positions,
                     compress_ratio=self.compress_ratio,
                     is_extend=group_member_rows is not None,
+                    force_pending_rows=mixed_dec_rows,
                 )
                 if write_locs.numel():
                     if group_member_rows is not None:
@@ -774,6 +806,16 @@ class QwenSparseAttnBackend(AttentionBackend):
                         extend_rope_matrix = build_rope_position_matrix(
                             rope_source, token_to_batch_idx.numel()
                         )
+                        if mixed_dec_rows is not None:
+                            # Mixed batch: ring-sourced entries need both
+                            # member sources; see the store path in
+                            # qsa_indexer.
+                            compress_group_ring_locs = build_group_ring_slots(
+                                req_pool_indices=row_req_pool_indices,
+                                group_end_positions=group_positions.long(),
+                                sequence_ids=group_sequence_ids.long(),
+                                compress_ratio=self.compress_ratio,
+                            )
                     else:
                         compress_group_ring_locs = build_group_ring_slots(
                             req_pool_indices=row_req_pool_indices,
@@ -794,6 +836,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_positions=group_positions,
             compress_sequence_ids=group_sequence_ids,
             compress_member_rows=group_member_rows,
+            has_mixed_ring_rows=mixed_dec_rows is not None,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
             decode_logical_positions=decode_logical_positions,

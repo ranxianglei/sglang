@@ -73,11 +73,14 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # holds each group's first member as a token-row index into this
     # forward's packed tensors (extend chunks are group-aligned, so every
     # member is in-chunk); paged forwards leave it None and source members
-    # from the per-request pending ring instead.
+    # from the per-request pending ring instead. Mixed-chunk forwards mark
+    # folded decode rows with -1 in compress_member_rows: those entries
+    # source their members from the ring like paged rows.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
     compress_member_rows: Optional[torch.Tensor] = None
+    has_mixed_ring_rows: bool = False
     is_cuda_graph: bool = False
     graph_write_locs: Optional[torch.Tensor] = None
     graph_compressed_page_table: Optional[torch.Tensor] = None
@@ -243,6 +246,7 @@ def build_pending_ring_slots(
     logical_positions: torch.Tensor,
     compress_ratio: int,
     is_extend: bool,
+    force_pending_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-token slots in the per-request pending ring.
 
@@ -251,7 +255,9 @@ def build_pending_ring_slots(
     forwards only that pending tail must survive the forward (compression
     sources members from the chunk itself), so older tokens dump into ring
     rows [0, ratio) -- request slot 0 is never allocated. Pure tensor
-    arithmetic, CUDA-graph safe.
+    arithmetic, CUDA-graph safe. ``force_pending_rows`` marks mixed-chunk
+    decode rows folded into an extend batch: their single token may close a
+    group the chunk did not carry, so it must always survive in the ring.
     """
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
@@ -260,6 +266,8 @@ def build_pending_ring_slots(
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
+        if force_pending_rows is not None:
+            pending = pending | force_pending_rows.long()[rows].bool()
         slots = torch.where(pending, slots, positions % compress_ratio)
     return slots
 

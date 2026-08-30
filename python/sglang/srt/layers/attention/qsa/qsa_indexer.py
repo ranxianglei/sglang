@@ -337,6 +337,41 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope = build_rope_position_matrix(
                     rope_positions, token_k.shape[0]
                 )
+            if metadata.has_mixed_ring_rows:
+                # Mixed-chunk: folded decode rows (member_rows < 0) close a
+                # group whose earlier members were written to the pending
+                # ring by previous decode steps, not by this chunk. Split the
+                # entries by member source and store them separately.
+                from_ring = member_rows < 0
+                idx_all = torch.arange(
+                    member_rows.numel(), device=member_rows.device
+                )
+                idx_direct = idx_all[~from_ring]
+                idx_ring = idx_all[from_ring]
+                if idx_direct.numel():
+                    self._store_compressed_groups(
+                        pool,
+                        group_locs[idx_direct],
+                        compressed_locs[idx_direct],
+                        source_keys,
+                        source_rope,
+                    )
+                if idx_ring.numel():
+                    ring_locs = metadata.compress_group_ring_locs
+                    if ring_locs is None:
+                        ring_locs = self._group_ring_slots(
+                            metadata,
+                            group_end_positions,
+                            metadata.compress_sequence_ids.long(),
+                        )
+                    self._store_compressed_groups(
+                        pool,
+                        ring_locs[idx_ring],
+                        compressed_locs[idx_ring],
+                        pool.get_qsa_key_state_buffer(self.layer_id),
+                        pool.qsa_rope_position_buffer,
+                    )
+                return
         else:
             # Paged eager rows (speculative fallback) complete at most one
             # group each; its members are exactly the pending ring window.
@@ -349,6 +384,18 @@ class QSAIndexer(MultiPlatformOp):
                 )
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
             source_rope = pool.qsa_rope_position_buffer
+        self._store_compressed_groups(
+            pool, group_locs, compressed_locs, source_keys, source_rope
+        )
+
+    def _store_compressed_groups(
+        self,
+        pool,
+        group_locs: torch.Tensor,
+        compressed_locs: torch.Tensor,
+        source_keys: torch.Tensor,
+        source_rope: torch.Tensor,
+    ) -> None:
         if self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
