@@ -2085,6 +2085,7 @@ def _post_process_topk_ids(
 # ours: runtime expert keep-mask ablation (SGLANG_EXPERT_KEEP_MASK=/path/keep.json)
 _EXPERT_KEEP_MASK = False
 _EXPERT_KEEP_COL_CACHE = {}
+_EXPERT_KEEP_REMAP_CACHE = {}
 
 
 def _load_expert_keep_mask():
@@ -2093,6 +2094,69 @@ def _load_expert_keep_mask():
     if not _p:
         return None
     return {int(k): list(map(int, v)) for k, v in _json.load(open(_p)).items()}
+
+
+# ours: keep-only expert offload — physical pool holds only kept experts.
+# SGLANG_EXPERT_KEEP_OFFLOAD=1 shrinks the on-GPU expert tensors to the keep
+# set; routing ids are remapped global->slot after top-k.
+def _expert_keep_offload_enabled():
+    import os
+    return os.environ.get("SGLANG_EXPERT_KEEP_OFFLOAD", "") == "1"
+
+
+def get_expert_keep_n(layer_id: int):
+    global _EXPERT_KEEP_MASK
+    if not _expert_keep_offload_enabled():
+        return None
+    if _EXPERT_KEEP_MASK is False:
+        _EXPERT_KEEP_MASK = _load_expert_keep_mask()
+    if _EXPERT_KEEP_MASK is None:
+        return None
+    _keep = _EXPERT_KEEP_MASK.get(int(layer_id))
+    return len(_keep) if _keep else None
+
+
+def get_expert_keep_slot(layer_id: int, global_expert_id: int):
+    global _EXPERT_KEEP_MASK
+    if not _expert_keep_offload_enabled():
+        return global_expert_id
+    if _EXPERT_KEEP_MASK is False:
+        _EXPERT_KEEP_MASK = _load_expert_keep_mask()
+    if _EXPERT_KEEP_MASK is None:
+        return global_expert_id
+    _keep = _EXPERT_KEEP_MASK.get(int(layer_id))
+    if not _keep:
+        return global_expert_id
+    try:
+        return _keep.index(global_expert_id)
+    except ValueError:
+        return None
+
+
+def _maybe_remap_topk_ids(topk_ids, layer_id, device):
+    global _EXPERT_KEEP_MASK, _EXPERT_KEEP_REMAP_CACHE
+    if not _expert_keep_offload_enabled() or layer_id is None:
+        return topk_ids
+    if _EXPERT_KEEP_MASK is False:
+        _EXPERT_KEEP_MASK = _load_expert_keep_mask()
+    if _EXPERT_KEEP_MASK is None:
+        return topk_ids
+    _key = (int(layer_id), device)
+    _remap = _EXPERT_KEEP_REMAP_CACHE.get(_key)
+    if _remap is None:
+        _keep = _EXPERT_KEEP_MASK.get(int(layer_id))
+        if not _keep:
+            _remap = False
+        else:
+            _n = max(_EXPERT_KEEP_MASK[int(layer_id)]) + 1 if _keep else 1
+            _tbl = torch.zeros(_n, dtype=torch.long, device=device)
+            for _slot, _gid in enumerate(_keep):
+                _tbl[_gid] = _slot
+            _remap = _tbl
+        _EXPERT_KEEP_REMAP_CACHE[_key] = _remap
+    if _remap is not False:
+        topk_ids = _remap[topk_ids.long()].to(topk_ids.dtype)
+    return topk_ids
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -2350,6 +2414,8 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
+
+    topk_ids = _maybe_remap_topk_ids(topk_ids, layer_id, topk_ids.device)
 
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids

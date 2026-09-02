@@ -2064,6 +2064,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             and mapped_name not in params_dict
                         ):
                             continue
+                        from sglang.srt.layers.moe.topk import (
+                            get_expert_keep_slot,
+                        )
+
+                        _slot_id = get_expert_keep_slot(
+                            layer_id if layer_id is not None else -1, expert_id
+                        )
+                        if _slot_id is None:
+                            continue
                         param = params_dict[mapped_name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -2071,7 +2080,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             loaded_weight,
                             mapped_name,
                             shard_id=shard_id,
-                            expert_id=expert_id,
+                            expert_id=_slot_id,
                         )
                     name = mapped_name
                     break

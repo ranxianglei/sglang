@@ -278,6 +278,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
+        from sglang.srt.layers.moe.topk import get_expert_keep_n
+
+        _phys_num_experts = (
+            get_expert_keep_n(layer_id) or config.num_experts
+        )
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
@@ -286,7 +291,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
-                config.num_experts + get_exec().moe.ep_num_redundant_experts
+                _phys_num_experts + get_exec().moe.ep_num_redundant_experts
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
                 + get_exec().moe.ep_num_redundant_experts
