@@ -42,3 +42,20 @@ Hardware floor: 96GB VRAM + ≥64GB free host RAM (PLE is pinned to host). Model
 
 - Both patches are clean candidates for upstream PRs once #36497 lands in `main` (they only touch files that #36497 introduces). Until then this branch is the usable artifact.
 - License: Apache 2.0 (unchanged, inherited from sgl-project/sglang).
+
+### 3. Inference-time expert pruning: keep-mask + keep-only offload
+`python/sglang/srt/layers/moe/topk.py` (+130 lines) + `qwen2_moe.py` / `qwen4_exp.py` loaders (+40)
+
+- **What**: serve a pruned MoE without re-exporting the checkpoint. `SGLANG_EXPERT_KEEP_MASK=keep.json`
+  (env, `{"layer": [expert_gids...]}`) selects the per-layer keep set from a router profile of your traffic.
+  With `SGLANG_EXPERT_KEEP_OFFLOAD=1`, non-kept experts are never loaded to GPU (host-pinned instead);
+  FusedMoE pool shrinks to the keep set and top-k ids are remapped to pool slots.
+- **Verified** (Qwen3.8-Flash-Next W4A16 512→296, 1×96GB): GPU weights -13GB, KV pool +31%,
+  single-stream parity (100.6 tok/s), quality gate green, anomaly self-heal 5/5.
+- Pipeline to reproduce the keep set on your own traffic: `tools/expert-tools/` (profile → make_keep → serve → re-slice).
+
+### 4. (WIP, not for upstream yet) cold-expert dynamic staging
+`python/sglang/srt/layers/moe/cold_pool.py` (+210 lines) — host-pinned cold library, per-layer LRU
+slots, strong-demand filter (sigmoid-score band × EMA counters), graph-safe slot remap. Works
+(self-heal 2/3 recovery vs 0/3 static) but the demand-signal design is still experimental; static
+keep sets remain pareto-optimal for our traffic.
