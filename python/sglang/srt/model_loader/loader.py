@@ -850,6 +850,9 @@ class DefaultModelLoader(BaseModelLoader):
                 ):
                     continue
                 quant_method.process_weights_after_loading(module)
+        from sglang.srt.layers.moe.cold_pool import maybe_shrink_after_process
+
+        maybe_shrink_after_process(model)
         return model.eval()
 
     def commit_model_weights(
@@ -1062,6 +1065,11 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        # ours: shrink FusedMoE expert pools to keep+cold slots (cold rows to pinned host RAM)
+        from sglang.srt.layers.moe.cold_pool import maybe_shrink_after_process
+
+        maybe_shrink_after_process(model)
 
 
 class LayeredModelLoader(DefaultModelLoader):

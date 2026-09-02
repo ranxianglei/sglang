@@ -1557,6 +1557,10 @@ class ModelRunner:
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
+        from sglang.srt.layers.moe.cold_pool import after_forward_hook
+
+        after_forward_hook()
+
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
             not self.is_draft_worker

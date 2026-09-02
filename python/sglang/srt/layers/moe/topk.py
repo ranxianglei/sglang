@@ -2101,6 +2101,10 @@ def _load_expert_keep_mask():
 # set; routing ids are remapped global->slot after top-k.
 def _expert_keep_offload_enabled():
     import os
+    from sglang.srt.layers.moe.cold_pool import cold_pool_enabled
+
+    if cold_pool_enabled() and not _COLD_ACTIVE:
+        return False
     return os.environ.get("SGLANG_EXPERT_KEEP_OFFLOAD", "") == "1"
 
 
@@ -2135,7 +2139,9 @@ def get_expert_keep_slot(layer_id: int, global_expert_id: int):
 
 def _maybe_remap_topk_ids(topk_ids, layer_id, device):
     global _EXPERT_KEEP_MASK, _EXPERT_KEEP_REMAP_CACHE
-    if not _expert_keep_offload_enabled() or layer_id is None:
+    if layer_id is None:
+        return topk_ids
+    if not (_expert_keep_offload_enabled() or _COLD_ACTIVE):
         return topk_ids
     if _EXPERT_KEEP_MASK is False:
         _EXPERT_KEEP_MASK = _load_expert_keep_mask()
@@ -2149,6 +2155,8 @@ def _maybe_remap_topk_ids(topk_ids, layer_id, device):
             _remap = False
         else:
             _n = max(_EXPERT_KEEP_MASK[int(layer_id)]) + 1 if _keep else 1
+            if _COLD_ACTIVE:
+                _n = max(_n, _COLD_NUM_EXPERTS)
             _tbl = torch.zeros(_n, dtype=torch.long, device=device)
             for _slot, _gid in enumerate(_keep):
                 _tbl[_gid] = _slot
@@ -2157,6 +2165,105 @@ def _maybe_remap_topk_ids(topk_ids, layer_id, device):
     if _remap is not False:
         topk_ids = _remap[topk_ids.long()].to(topk_ids.dtype)
     return topk_ids
+
+
+# ours: cold-expert pool state (see layers/moe/cold_pool.py)
+_COLD_ACTIVE = False
+_COLD_NUM_EXPERTS = 0
+_LAST_GLOBAL_IDS = {}
+
+
+def activate_cold_pool(num_experts: int = 0):
+    global _COLD_ACTIVE, _COLD_NUM_EXPERTS
+    _COLD_ACTIVE = True
+    if num_experts > 0:
+        _COLD_NUM_EXPERTS = num_experts
+
+
+def get_last_global_ids(layer_id: int):
+    buf = _STASH_BUFS.get(int(layer_id))
+    if buf is None:
+        return None
+    return buf[buf >= 0]
+
+
+_STASH_BUFS = {}
+_STASH_LOGGED = set()
+
+
+_STASH_SCORES = {}
+_COLD_DIRTY = False
+
+
+def mark_cold_dirty() -> None:
+    global _COLD_DIRTY
+    _COLD_DIRTY = True
+
+
+def consume_cold_dirty() -> bool:
+    global _COLD_DIRTY
+    d = _COLD_DIRTY
+    _COLD_DIRTY = False
+    return d
+
+
+def stash_global_ids(layer_id: int, topk_ids, topk_scores=None):
+    if not (_COLD_ACTIVE or _expert_keep_offload_enabled()) or layer_id is None:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    layer_id = int(layer_id)
+    buf = _STASH_BUFS.get(layer_id)
+    flat = topk_ids.reshape(-1).long()
+    if buf is None:
+        buf = torch.full(
+            (8192,),
+            -1,
+            dtype=torch.long,
+            device=topk_ids.device,
+        )
+        _STASH_BUFS[layer_id] = buf
+    n = min(int(flat.numel()), buf.numel())
+    buf[n:] = -1
+    buf[:n] = flat[:n]
+    if topk_scores is not None:
+        sbuf = _STASH_SCORES.get(layer_id)
+        if sbuf is None:
+            sbuf = torch.full(
+                (8192,), -1.0, dtype=torch.float32, device=flat.device
+            )
+            _STASH_SCORES[layer_id] = sbuf
+        sflat = topk_scores.reshape(-1).float()
+        sn = min(int(sflat.numel()), sbuf.numel())
+        sbuf[sn:] = -1.0
+        sbuf[:sn] = sflat[:sn]
+
+
+def get_last_scores(layer_id: int):
+    return _STASH_SCORES.get(int(layer_id))
+    mark_cold_dirty()
+    _STASH_LOGGED.add(layer_id)
+    if len(_STASH_LOGGED) == 1:
+        logger.info("[COLD-POOL] stash first call layer=%d numel=%d", layer_id, int(flat.numel()))
+
+
+def unmask_cold_expert(pool, gid: int, slot: int):
+    layer = int(pool.layer_id)
+    keep_len = len(_EXPERT_KEEP_MASK[layer])
+    if pool.bias_gpu is None:
+        for key, col in _EXPERT_KEEP_COL_CACHE.items():
+            if key[0] == layer and col is not False:
+                pool.bias_gpu = col
+                break
+    if pool.bias_gpu is not None:
+        pool.bias_gpu[gid] = 0.0
+    if pool.remap_gpu is None:
+        for key, tbl in _EXPERT_KEEP_REMAP_CACHE.items():
+            if key[0] == layer and tbl is not False:
+                pool.remap_gpu = tbl
+                break
+    if pool.remap_gpu is not None:
+        pool.remap_gpu[gid] = keep_len + slot
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -2219,6 +2326,14 @@ def select_experts(
                 _col[_keep] = 0.0
             _EXPERT_KEEP_COL_CACHE[_key] = _col
         if _col is not False:
+            if _COLD_ACTIVE:
+                _raw_k = min(top_k, router_logits.shape[-1])
+                _raw = torch.topk(router_logits, k=_raw_k, dim=-1)
+                stash_global_ids(
+                    layer_id,
+                    _raw[1],
+                    torch.sigmoid(_raw[0]),
+                )
             router_logits = router_logits + _col
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
