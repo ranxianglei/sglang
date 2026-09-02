@@ -2081,6 +2081,19 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights, recorder_topk_ids
 
 
+
+# ours: runtime expert keep-mask ablation (SGLANG_EXPERT_KEEP_MASK=/path/keep.json)
+_EXPERT_KEEP_MASK = False
+_EXPERT_KEEP_COL_CACHE = {}
+
+
+def _load_expert_keep_mask():
+    import os, json as _json
+    _p = os.environ.get("SGLANG_EXPERT_KEEP_MASK", "")
+    if not _p:
+        return None
+    return {int(k): list(map(int, v)) for k, v in _json.load(open(_p)).items()}
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -2117,6 +2130,32 @@ def select_experts(
         correction_bias=correction_bias,
         info=expert_location_dispatch_info,
     )
+
+    # ours: runtime expert keep-mask (see _load_expert_keep_mask)
+    # NOTE: bias columns are built on first (eager/warmup) call and cached per
+    # (layer, dtype): list->CUDA indexing is an H2D copy, which is illegal
+    # during CUDA graph capture.
+    global _EXPERT_KEEP_MASK, _EXPERT_KEEP_COL_CACHE
+    if _EXPERT_KEEP_MASK is False:
+        _EXPERT_KEEP_MASK = _load_expert_keep_mask()
+    if _EXPERT_KEEP_MASK is not None and layer_id is not None:
+        _key = (int(layer_id), router_logits.dtype)
+        _col = _EXPERT_KEEP_COL_CACHE.get(_key)
+        if _col is None:
+            _keep = _EXPERT_KEEP_MASK.get(int(layer_id))
+            if _keep is None:
+                _col = False
+            else:
+                _col = torch.full(
+                    (router_logits.shape[-1],),
+                    torch.finfo(router_logits.dtype).min,
+                    dtype=router_logits.dtype,
+                    device=router_logits.device,
+                )
+                _col[_keep] = 0.0
+            _EXPERT_KEEP_COL_CACHE[_key] = _col
+        if _col is not False:
+            router_logits = router_logits + _col
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
