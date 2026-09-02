@@ -28,3 +28,4 @@ and re-slice checkpoints so future expert edits touch one small file.
 
 - GPU weights 58→44.9GB (-13GB), KV pool +31%, single-stream 100.6 tok/s (parity),
   quality gate green, anomalous-context self-heal 5/5 (vs 0/3 without heal-top union)
+A one-command CLI + community keep-set sharing lives at https://github.com/ranxianglei/sglang-expert-profile
