@@ -57,7 +57,7 @@ Hardware floor: 96GB VRAM + ≥64GB free host RAM (PLE is pinned to host). Model
   FusedMoE pool shrinks to the keep set and top-k ids are remapped to pool slots.
 - **Verified** (Qwen3.8-Flash-Next W4A16 512→296, 1×96GB): GPU weights -13GB, KV pool +31%,
   single-stream parity (100.6 tok/s), quality gate green, anomaly self-heal 5/5.
-- Pipeline to reproduce the keep set on your own traffic: `tools/expert-tools/` (profile → make_keep → serve → re-slice).
+- Pipeline to reproduce the keep set on your own traffic: **[ranxianglei/sglang-expert-profile](https://github.com/ranxianglei/sglang-expert-profile)** (standalone project — profile recorder CLI + community keep-set seeds: daily-294 / daily-heal-296); quick pipeline also in `tools/expert-tools/` (profile → make_keep → serve → re-slice).
 
 ### 4. (WIP, not for upstream yet) cold-expert dynamic staging
 `python/sglang/srt/layers/moe/cold_pool.py` (+210 lines) — host-pinned cold library, per-layer LRU
