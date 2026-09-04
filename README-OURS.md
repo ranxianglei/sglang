@@ -23,8 +23,13 @@ Base of this branch: `ed9cbb16c` (imported working tree of the PR branch) + two 
 ## Serve command (reference)
 
 ```bash
+# --- expert keep-mask (optional, see §3 below) ---
+# SGLANG_EXPERT_KEEP_MASK=$PWD/tools/expert-tools/keep_heal.json   # 296/512 keep set
+# SGLANG_EXPERT_KEEP_OFFLOAD=1                                     # non-kept experts stay on host (-13GB VRAM)
+# export both before launch; without them you get the full 512-expert model
+
 python -m sglang.launch_server \
-  --model-path <w4a16-pruned-checkpoint> \
+  --model-path <w4a16-checkpoint> \
   --ple-offload-embedding \
   --moe-a2a-backend none \
   --linear-attn-prefill-backend triton \
