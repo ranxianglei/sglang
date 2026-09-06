@@ -93,6 +93,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # boundary). None when radix tracking is off / flag off; the kernel
         # treats None as "no forced flush" (byte-identical to slice 1a/1b).
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
+        skip_flag = kwargs.get("skip_flag")
         if (
             replayssm_d is not None
             and replayssm_k is not None
@@ -129,6 +130,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            skip_flag=skip_flag,
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output

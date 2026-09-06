@@ -208,6 +208,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    HAS_SKIP_FLAG: tl.constexpr,
+    skip_flag,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -253,6 +255,15 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     g_val = -tl.exp(A_log_val) * softplus_x
     beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
 
+    # ours: lazy-step flag — runtime value in GPU memory, CUDA-graph safe
+    # (graph captures the kernel launch; the flag *value* is read fresh each replay)
+    do_skip = HAS_SKIP_FLAG and (tl.load(skip_flag) != 0)
+
+    if do_skip:
+        b_o = tl.sum(b_h * b_q[None, :], 1)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        return
+
     b_h *= exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)
     b_v *= beta_val
@@ -276,6 +287,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    skip_flag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -396,6 +408,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        HAS_SKIP_FLAG=skip_flag is not None,
+        skip_flag=skip_flag if skip_flag is not None else mixed_qkv,
         num_warps=num_warps,
         num_stages=num_stages,
     )
