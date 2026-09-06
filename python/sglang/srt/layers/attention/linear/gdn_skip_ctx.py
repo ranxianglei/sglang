@@ -82,3 +82,34 @@ def should_skip_gdn(layer_idx: int = -1) -> bool:
     if _SKIP_LAYERS and layer_idx not in _SKIP_LAYERS:
         return False
     return _STEP_SKIP
+
+
+# decay-only stride (time-mock): on every Nth decode step the SSM kernel
+# applies only the time decay (S *= exp(g)) and skips the write; readout uses
+# the decayed state. Graph-safe: persistent device tensor flipped by
+# gdn_decay_tick() outside captured regions.
+
+_DECAY_EVERY = int(os.environ.get("SGLANG_GDN_DECAY_EVERY", "0") or 0)
+_DECAY_COUNTER = 0
+_DECAY_FLAG: "torch.Tensor | None" = None
+
+
+def gdn_decay_enabled() -> bool:
+    return _DECAY_EVERY >= 2
+
+
+def gdn_decay_tick(device) -> None:
+    """One call per decode forward (graph-external python) flips the flag."""
+    global _DECAY_COUNTER, _DECAY_FLAG
+    if _DECAY_EVERY < 2:
+        return
+    flag = gdn_decay_flag(device)
+    _DECAY_COUNTER += 1
+    flag.fill_(1 if _DECAY_COUNTER % _DECAY_EVERY == 0 else 0)
+
+
+def gdn_decay_flag(device) -> "torch.Tensor":
+    global _DECAY_FLAG
+    if _DECAY_FLAG is None:
+        _DECAY_FLAG = torch.zeros(1, dtype=torch.int32, device=device)
+    return _DECAY_FLAG
