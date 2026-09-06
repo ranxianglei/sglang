@@ -263,6 +263,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepSeek-V3.2). CUDA can opt in later once validated there.
         self.dsa_dual_graph = False
         self.dsa_index_topk: Optional[int] = None
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_stride_enabled,
+            gdn_stride_every,
+        )
+
+        self.gdn_dual_graph = gdn_stride_enabled()
+        self._gdn_replay_counter = 0
         from sglang.srt.configs.model_config import (
             get_dsa_index_topk,
             is_deepseek_dsa,
@@ -575,6 +582,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return "lora"
         return "nolora"
+
+    def _resolve_gdn_variant(self) -> Optional[str]:
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import gdn_stride_every
+
+        if not getattr(self, "gdn_dual_graph", False):
+            return None
+        self._gdn_replay_counter += 1
+        if self._gdn_replay_counter % gdn_stride_every() == 0:
+            return "gdnskip"
+        return None
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
@@ -1082,6 +1099,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import set_capture_gdn_skip
+
+        gdn_variants = [True, False] if getattr(self, "gdn_dual_graph", False) else [None]
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1093,25 +1113,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                for dsa_variant in dsa_variants:
-                    _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+            for gv in gdn_variants:
+                set_capture_gdn_skip(gv is True)
+                for variant_label, _variant_has_lora in lora_variants:
+                    _set_capture_lora_variant(variant_label)
+                    for dsa_variant in dsa_variants:
+                        _set_capture_dsa_variant(dsa_variant)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            cap_label = "gdnskip" if gv is True else variant_label
+                            if dsa_variant is None:
+                                self.capture_one_shape(bs, forward, stream_idx, cap_label)
+                            else:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, cap_label, dsa_variant
+                                )
         _set_capture_dsa_variant(None)
+        set_capture_gdn_skip(False)
 
     def capture_one_shape(
         self,
@@ -1370,6 +1392,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
+        if getattr(self, "gdn_dual_graph", False):
+            gdn_label = self._resolve_gdn_variant()
+            if gdn_label is not None:
+                variant_label = gdn_label
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
