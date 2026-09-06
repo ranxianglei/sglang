@@ -584,11 +584,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return "nolora"
 
     def _resolve_gdn_variant(self) -> Optional[str]:
-        from sglang.srt.layers.attention.linear.gdn_skip_ctx import gdn_stride_every
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_stride_every,
+            gdn_stride_stagger,
+        )
 
         if not getattr(self, "gdn_dual_graph", False):
             return None
         self._gdn_replay_counter += 1
+        if gdn_stride_stagger():
+            return f"gdnskip{self._gdn_replay_counter & 1}"
         if self._gdn_replay_counter % gdn_stride_every() == 0:
             return "gdnskip"
         return None
@@ -1099,9 +1104,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
-        from sglang.srt.layers.attention.linear.gdn_skip_ctx import set_capture_gdn_skip
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_stride_stagger,
+            set_capture_gdn_skip,
+        )
 
-        gdn_variants = [True, False] if getattr(self, "gdn_dual_graph", False) else [None]
+        if getattr(self, "gdn_dual_graph", False):
+            gdn_variants = [0, 1] if gdn_stride_stagger() else [True, False]
+        else:
+            gdn_variants = [None]
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1114,7 +1125,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             for gv in gdn_variants:
-                set_capture_gdn_skip(gv is True)
+                if gdn_stride_stagger():
+                    set_capture_gdn_skip(True, gv)
+                else:
+                    set_capture_gdn_skip(gv is True)
                 for variant_label, _variant_has_lora in lora_variants:
                     _set_capture_lora_variant(variant_label)
                     for dsa_variant in dsa_variants:
@@ -1125,7 +1139,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             num_tokens=bs * self.captured_req_width,
                             tp_group=self.model_runner.tp_group,
                         ) as forward:
-                            cap_label = "gdnskip" if gv is True else variant_label
+                            if gv is None or gv is False:
+                                cap_label = variant_label
+                            elif gdn_stride_stagger():
+                                cap_label = f"gdnskip{gv}"
+                            else:
+                                cap_label = "gdnskip"
                             if dsa_variant is None:
                                 self.capture_one_shape(bs, forward, stream_idx, cap_label)
                             else:
