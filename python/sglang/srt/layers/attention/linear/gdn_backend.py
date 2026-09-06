@@ -4,40 +4,10 @@ import os
 
 import torch
 
-# ours: lazy GDN decode (SGLANG_GDN_LAZY_EVERY=N -> every Nth decode step keeps
-# the old recurrent state: readout o = q·S_old, no update, no writeback).
-# Kernel-side branch on a GPU flag tensor; CUDA-graph safe because the flag is
-# written by gdn_lazy_tick() in model_runner.forward (outside any graph).
-# SGLANG_GDN_SKIP_EVERY (v1, python save/restore, eager-only) is retired.
-_GDN_LAZY_EVERY = int(os.environ.get("SGLANG_GDN_LAZY_EVERY", "0") or 0)
-_GDN_LAZY_FLAG = [None]  # [int32 GPU tensor], created on first use
-_GDN_LAZY_COUNTER = [0]
-
-
-def _ours_lazy_flag():
-    if _GDN_LAZY_EVERY <= 0:
-        return None
-    return _GDN_LAZY_FLAG[0]
-
-
-def gdn_lazy_tick(device=None):
-    """Advance the lazy-step counter and publish the flag for the next forward.
-
-    Must be called from python code that runs once per decode step OUTSIDE any
-    CUDA graph replay (e.g. model_runner.forward entry): the fill_() below is
-    an ordinary GPU op enqueued between replays, so the kernel reads a fresh
-    value every step while the graph itself stays capture-stable.
-    """
-    if _GDN_LAZY_EVERY <= 0:
-        return
-    _GDN_LAZY_COUNTER[0] += 1
-    if _GDN_LAZY_FLAG[0] is None:
-        _GDN_LAZY_FLAG[0] = torch.zeros(
-            1, dtype=torch.int32, device=device or torch.cuda.current_device()
-        )
-    _GDN_LAZY_FLAG[0].fill_(
-        1 if _GDN_LAZY_COUNTER[0] % _GDN_LAZY_EVERY == 1 else 0
-    )
+# ours: stride-N GDN decode experiment (SGLANG_GDN_SKIP_EVERY=2 -> every 2nd
+# decode step discards the state write). 0 = disabled.
+_GDN_SKIP_EVERY = int(os.environ.get("SGLANG_GDN_SKIP_EVERY", "0") or 0)
+_GDN_STEP_COUNTER = [0]
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -409,6 +379,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if _GDN_SKIP_EVERY > 0:
+            _GDN_STEP_COUNTER[0] += 1
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
@@ -458,6 +430,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
+        # ours: stride-N decode experiment — on skipped steps the kernel still
+        # runs but the slot state is restored afterwards (write discarded, so
+        # the next step reads the previous state). Requires eager mode.
+        _ours_skip = (
+            _GDN_SKIP_EVERY > 0
+            and _GDN_STEP_COUNTER[0] % _GDN_SKIP_EVERY == 1
+        )
+        if _ours_skip:
+            _ours_saved_ssm = ssm_states[cache_indices].clone()
+            _ours_saved_conv = conv_states[cache_indices].clone()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -486,7 +468,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
-                skip_flag=_ours_lazy_flag(),
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
@@ -520,6 +501,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
+
+        if _ours_skip:
+            ssm_states[cache_indices] = _ours_saved_ssm
+            conv_states[cache_indices] = _ours_saved_conv
 
         return core_attn_out
 

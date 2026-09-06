@@ -1509,12 +1509,6 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
-        # ours: GDN lazy-step flag publish (must run outside CUDA graphs)
-        if forward_batch.forward_mode.is_decode():
-            from sglang.srt.layers.attention.linear.gdn_backend import gdn_lazy_tick
-
-            gdn_lazy_tick(self.device)
-
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
