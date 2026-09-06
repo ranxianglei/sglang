@@ -1,6 +1,13 @@
 from typing import Optional, Tuple, Union
 
+import os
+
 import torch
+
+# ours: stride-N GDN decode experiment (SGLANG_GDN_SKIP_EVERY=2 -> every 2nd
+# decode step discards the state write). 0 = disabled.
+_GDN_SKIP_EVERY = int(os.environ.get("SGLANG_GDN_SKIP_EVERY", "0") or 0)
+_GDN_STEP_COUNTER = [0]
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -372,6 +379,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if _GDN_SKIP_EVERY > 0:
+            _GDN_STEP_COUNTER[0] += 1
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
@@ -421,6 +430,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
+        # ours: stride-N decode experiment — on skipped steps the kernel still
+        # runs but the slot state is restored afterwards (write discarded, so
+        # the next step reads the previous state). Requires eager mode.
+        _ours_skip = (
+            _GDN_SKIP_EVERY > 0
+            and _GDN_STEP_COUNTER[0] % _GDN_SKIP_EVERY == 1
+        )
+        if _ours_skip:
+            _ours_saved_ssm = ssm_states[cache_indices].clone()
+            _ours_saved_conv = conv_states[cache_indices].clone()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -482,6 +501,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
+
+        if _ours_skip:
+            ssm_states[cache_indices] = _ours_saved_ssm
+            conv_states[cache_indices] = _ours_saved_conv
 
         return core_attn_out
 
