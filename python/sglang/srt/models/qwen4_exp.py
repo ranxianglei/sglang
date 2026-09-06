@@ -1417,8 +1417,8 @@ class Qwen4ExpLinearDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
-            if should_skip_gdn():
-                pass
+            if should_skip_gdn(self.layer_id):
+                hidden_states = hidden_states * 0
             else:
                 hidden_states = self.linear_attn(hidden_states, forward_batch)
 

@@ -23,6 +23,9 @@ _CAPTURE_SKIP = False
 _STEP_SKIP = False
 _EVERY = int(os.environ.get("SGLANG_GDN_SKIP_EVERY", "0") or 0)
 _COUNTER = 0
+_SKIP_LAYERS = frozenset(
+    int(x) for x in os.environ.get("SGLANG_GDN_SKIP_LAYERS", "").split(",") if x.strip()
+)
 
 
 def gdn_stride_enabled() -> bool:
@@ -53,9 +56,9 @@ def gdn_step_begin() -> bool:
     return _STEP_SKIP
 
 
-def should_skip_gdn() -> bool:
-    """Per-layer gate. Graph capture reads the capture flag; eager reads the
-    per-step decision. During graph replay this code never runs."""
+def should_skip_gdn(layer_idx: int = -1) -> bool:
     if torch.cuda.is_current_stream_capturing():
         return _CAPTURE_SKIP
+    if _SKIP_LAYERS and layer_idx not in _SKIP_LAYERS:
+        return False
     return _STEP_SKIP
