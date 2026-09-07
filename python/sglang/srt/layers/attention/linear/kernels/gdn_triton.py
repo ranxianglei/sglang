@@ -130,6 +130,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             decay_flag=kwargs.get("gdn_decay_flag"),
+            gscale_ptr=kwargs.get("gdn_gscale"),
+            beta_scale_ptr=kwargs.get("gdn_beta_scale"),
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output

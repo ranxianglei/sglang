@@ -194,6 +194,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     ht,
     ssm_state_indices,
     decay_flag,
+    gscale_ptr,
+    beta_scale_ptr,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -254,15 +256,18 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     g_val = -tl.exp(A_log_val) * softplus_x
 
     if tl.load(decay_flag) > 0:
-        b_h *= exp(g_val)
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-        p_ht = ht + state_idx * stride_final_state_token
-        p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
-        return
-
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+        b_h *= exp(g_val * tl.load(gscale_ptr))
+        bs = tl.load(beta_scale_ptr)
+        if bs >= 1.0:
+            b_o = tl.sum(b_h * b_q[None, :], 1)
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+            p_ht = ht + state_idx * stride_final_state_token
+            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            return
+        beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32) * bs
+    else:
+        beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
 
     b_h *= exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)
@@ -288,6 +293,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     decay_flag: "torch.Tensor | None" = None,
+    gscale_ptr: "torch.Tensor | None" = None,
+    beta_scale_ptr: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -385,6 +392,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     grid = (NV, B * HV)
     if decay_flag is None:
         decay_flag = torch.zeros(1, dtype=torch.int32, device=dev)
+    if gscale_ptr is None:
+        gscale_ptr = torch.ones(1, dtype=torch.float32, device=dev)
+    if beta_scale_ptr is None:
+        beta_scale_ptr = torch.ones(1, dtype=torch.float32, device=dev)
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
@@ -396,6 +407,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         decay_flag=decay_flag,
+        gscale_ptr=gscale_ptr,
+        beta_scale_ptr=beta_scale_ptr,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,

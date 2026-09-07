@@ -105,7 +105,10 @@ def gdn_decay_tick(device) -> None:
         return
     flag = gdn_decay_flag(device)
     _DECAY_COUNTER += 1
-    flag.fill_(1 if _DECAY_COUNTER % _DECAY_EVERY == 0 else 0)
+    val = 1 if _DECAY_COUNTER % _DECAY_EVERY == 0 else 0
+    flag.fill_(val)
+    if _DECAY_COUNTER <= 40:
+        print(f"[gdn-decay-debug] tick={_DECAY_COUNTER} flag={val}", flush=True)
 
 
 def gdn_decay_flag(device) -> "torch.Tensor":
@@ -113,3 +116,23 @@ def gdn_decay_flag(device) -> "torch.Tensor":
     if _DECAY_FLAG is None:
         _DECAY_FLAG = torch.zeros(1, dtype=torch.int32, device=device)
     return _DECAY_FLAG
+
+
+_GSCALE = float(os.environ.get("SGLANG_GDN_DECAY_GSCALE", "1.0") or 1.0)
+_BETA_SCALE = float(os.environ.get("SGLANG_GDN_DECAY_BETA", "1.0") or 1.0)
+_GSCALE_T: "torch.Tensor | None" = None
+_BETA_SCALE_T: "torch.Tensor | None" = None
+
+
+def gdn_gscale(device) -> "torch.Tensor":
+    global _GSCALE_T
+    if _GSCALE_T is None:
+        _GSCALE_T = torch.full((1,), _GSCALE, dtype=torch.float32, device=device)
+    return _GSCALE_T
+
+
+def gdn_beta_scale(device) -> "torch.Tensor":
+    global _BETA_SCALE_T
+    if _BETA_SCALE_T is None:
+        _BETA_SCALE_T = torch.full((1,), _BETA_SCALE, dtype=torch.float32, device=device)
+    return _BETA_SCALE_T

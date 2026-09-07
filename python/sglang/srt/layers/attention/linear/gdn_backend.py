@@ -453,8 +453,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
             from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+                gdn_beta_scale,
                 gdn_decay_enabled,
                 gdn_decay_flag,
+                gdn_gscale,
             )
 
             core_attn_out = self.kernel_dispatcher.packed_decode(
@@ -470,6 +472,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_v_dim=layer.head_v_dim,
                 gdn_decay_flag=(
                     gdn_decay_flag(ssm_states.device) if gdn_decay_enabled() else None
+                ),
+                gdn_gscale=(
+                    gdn_gscale(ssm_states.device) if gdn_decay_enabled() else None
+                ),
+                gdn_beta_scale=(
+                    gdn_beta_scale(ssm_states.device)
+                    if gdn_decay_enabled()
+                    else None
                 ),
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
