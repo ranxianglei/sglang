@@ -60,11 +60,11 @@ def get_capture_gdn_skip() -> bool:
 def gdn_step_begin() -> bool:
     """Called once per decode forward (eager path). Returns True on skip steps."""
     global _COUNTER, _STEP_SKIP
-    if _EVERY < 2:
+    if _EVERY < 2 and _REUSE_EVERY < 2:
         _STEP_SKIP = False
         return False
     _COUNTER += 1
-    _STEP_SKIP = _COUNTER % _EVERY == 0
+    _STEP_SKIP = _EVERY >= 2 and _COUNTER % _EVERY == 0
     return _STEP_SKIP
 
 
@@ -82,6 +82,43 @@ def should_skip_gdn(layer_idx: int = -1) -> bool:
     if _SKIP_LAYERS and layer_idx not in _SKIP_LAYERS:
         return False
     return _STEP_SKIP
+
+
+# lazy-reuse stride (v5): on every Nth decode step the in_proj_qkvz GEMV is
+# skipped and the layer reuses the previous step's cached projection (q/k/v/z
+# one step stale); in_proj_ba is computed fresh so beta/g (the time signal)
+# stay current. conv update + recurrent kernel + out_proj run normally, so
+# the state keeps receiving (delayed) write increments.
+_REUSE_EVERY = int(os.environ.get("SGLANG_GDN_REUSE_EVERY", "0") or 0)
+_QKVZ_CACHE: "dict[int, torch.Tensor]" = {}
+
+
+def gdn_reuse_enabled() -> bool:
+    return _REUSE_EVERY >= 2
+
+
+def gdn_reuse_every() -> int:
+    return _REUSE_EVERY
+
+
+def gdn_reuse_is_skip() -> bool:
+    """True on steps that should reuse the cached qkvz instead of in_proj."""
+    if _REUSE_EVERY < 2:
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return _CAPTURE_SKIP
+    return _COUNTER % _REUSE_EVERY == 0
+
+
+def gdn_qkvz_cache(
+    layer_id: int, num_slots: int, dim: int, device, dtype=torch.bfloat16
+) -> torch.Tensor:
+    """Persistent per-slot cache of the in_proj_qkvz output. Lazily built."""
+    t = _QKVZ_CACHE.get(layer_id)
+    if t is None:
+        t = torch.zeros(num_slots, dim, dtype=dtype, device=device)
+        _QKVZ_CACHE[layer_id] = t
+    return t
 
 
 # decay-only stride (time-mock): on every Nth decode step the SSM kernel

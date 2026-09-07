@@ -264,11 +264,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dsa_dual_graph = False
         self.dsa_index_topk: Optional[int] = None
         from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_reuse_enabled,
             gdn_stride_enabled,
             gdn_stride_every,
         )
 
-        self.gdn_dual_graph = gdn_stride_enabled()
+        self.gdn_dual_graph = gdn_stride_enabled() or gdn_reuse_enabled()
         self._gdn_replay_counter = 0
         from sglang.srt.configs.model_config import (
             get_dsa_index_topk,
@@ -585,6 +586,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _resolve_gdn_variant(self) -> Optional[str]:
         from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_reuse_every,
             gdn_stride_every,
             gdn_stride_stagger,
         )
@@ -594,7 +596,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._gdn_replay_counter += 1
         if gdn_stride_stagger():
             return f"gdnskip{self._gdn_replay_counter & 1}"
-        if self._gdn_replay_counter % gdn_stride_every() == 0:
+        _every = gdn_stride_every() or gdn_reuse_every()
+        if _every >= 2 and self._gdn_replay_counter % _every == 0:
             return "gdnskip"
         return None
 
@@ -1110,7 +1113,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         if getattr(self, "gdn_dual_graph", False):
-            gdn_variants = [0, 1] if gdn_stride_stagger() else [True, False]
+            gdn_variants = [0, 1] if gdn_stride_stagger() else [False, True]
         else:
             gdn_variants = [None]
         for bs in capture_range:
