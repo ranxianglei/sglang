@@ -45,7 +45,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.attention.linear.gdn_skip_ctx import should_skip_gdn
+from sglang.srt.layers.attention.linear.gdn_skip_ctx import should_skip_gdn, gdn_cov_accum
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
@@ -1420,6 +1420,7 @@ class Qwen4ExpLinearDecoderLayer(
             if should_skip_gdn(self.layer_id):
                 hidden_states = hidden_states * 0
             else:
+                gdn_cov_accum(self.layer_id, hidden_states)
                 hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(

@@ -173,3 +173,35 @@ def gdn_beta_scale(device) -> "torch.Tensor":
     if _BETA_SCALE_T is None:
         _BETA_SCALE_T = torch.full((1,), _BETA_SCALE, dtype=torch.float32, device=device)
     return _BETA_SCALE_T
+
+
+# ---- activation covariance collector (ASVD probe; env SGLANG_GDN_COV=1) ----
+_COV_ON = bool(os.environ.get("SGLANG_GDN_COV", ""))
+_COV = {}
+_COV_N = {}
+
+def gdn_cov_accum(layer_id: int, x) -> None:
+    # x: [..., hidden] on GPU. Accumulate x^T x per layer for spectrum analysis.
+    if not _COV_ON:
+        return
+    import torch
+    xf = x.detach().reshape(-1, x.shape[-1]).float()
+    if xf.numel() == 0:
+        return
+    c = _COV.get(layer_id)
+    if c is None or c.device != xf.device:
+        c = torch.zeros(xf.shape[-1], xf.shape[-1], dtype=torch.float32, device=xf.device)
+        _COV[layer_id] = c
+        _COV_N[layer_id] = 0
+    _COV[layer_id] += xf.T @ xf
+    _COV_N[layer_id] += xf.shape[0]
+    if _COV_N[layer_id] >= 4096 and _COV_N[layer_id] % 4096 < xf.shape[0]:
+        gdn_cov_dump()
+
+def gdn_cov_dump() -> str:
+    if not _COV_ON:
+        return ""
+    import torch
+    out = os.environ.get("SGLANG_GDN_COV_OUT", "/tmp/opencode/gdn_cov.pt")
+    torch.save({int(k): (v.cpu(), _COV_N.get(k, 0)) for k, v in _COV.items()}, out)
+    return out
