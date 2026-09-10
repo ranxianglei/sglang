@@ -716,7 +716,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 _U, _sig, _Vh = torch.linalg.svd(_M, full_matrices=False)
                 _r = min(_svd_rank, _sig.shape[-1])
                 _S2 = (_U[..., :_r] * _sig[..., :_r].unsqueeze(-2)) @ _Vh[..., :_r, :]
-                ssm_states[_idx] = _S2.reshape(_orig_shape).to(ssm_states.dtype)
+                ssm_states[_idx] = _S2.reshape(_orig_shape).to(ssm_states.dtype)        # [gdn-distill] dump post-prefill recurrent state for teacher/student
+        # collection. One .pt per (layer, slot); the final chunk of a prefill
+        # leaves the complete state. SGLANG_GDN_DUMP_STATE=<dir>. Skipped
+        # during CUDA graph capture (host sync illegal there).
+        _dump_dir = os.environ.get("SGLANG_GDN_DUMP_STATE")
+        if _dump_dir and not torch.cuda.is_current_stream_capturing():
+            try:
+                import time as _time
+                os.makedirs(_dump_dir, exist_ok=True)
+                _slots = cache_indices.reshape(-1).tolist() if torch.is_tensor(cache_indices) else list(cache_indices)
+                for _slot_i in _slots:
+                    torch.save(
+                        {"state": ssm_states[_slot_i].detach().float().cpu(), "layer": layer.layer_id, "slot": int(_slot_i), "t": _time.time()},
+                        os.path.join(_dump_dir, f"s_L{layer.layer_id:02d}_slot{int(_slot_i)}_{_time.time():.3f}.pt"),
+                    )
+            except Exception as _e:
+                print(f"[gdn-distill] dump failed: {_e}", flush=True)
 
         return core_attn_out
 
