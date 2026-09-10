@@ -1,13 +1,7 @@
 from typing import Optional, Tuple, Union
 
 import os
-
 import torch
-
-# ours: stride-N GDN decode experiment (SGLANG_GDN_SKIP_EVERY=2 -> every 2nd
-# decode step discards the state write). 0 = disabled.
-_GDN_SKIP_EVERY = int(os.environ.get("SGLANG_GDN_SKIP_EVERY", "0") or 0)
-_GDN_STEP_COUNTER = [0]
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -20,16 +14,15 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    get_linear_attn_decode_backend,
+    get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
-
-_is_hip = is_hip()
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -74,22 +67,23 @@ elif is_cpu():
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
+    args = model_runner.server_args
     if (
-        get_exec().mamba.linear_attn_prefill_backend is not None
-        or get_exec().mamba.linear_attn_backend != "triton"
-        or get_memory().enable_page_major_kv_layout
+        args.linear_attn_prefill_backend is not None
+        or args.linear_attn_backend != "triton"
+        or args.enable_page_major_kv_layout
         or not is_cuda()
         or torch.cuda.get_device_capability()[0] != 10
     ):
         return None
 
     cuda_version = torch.version.cuda
-    chunk_size = get_schedule().chunked_prefill_size
+    chunk_size = args.chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or get_schedule().enable_dynamic_chunking
+        or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
         or getattr(config, "linear_key_head_dim", None) != 128
@@ -117,7 +111,6 @@ class GDNKernelDispatcher:
         self,
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
-        verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
@@ -143,10 +136,6 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
-        elif decode_backend.is_helion():
-            raise ValueError(
-                "The Helion linear-attention backend supports KDA only, not GDN."
-            )
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -186,22 +175,13 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
-        elif prefill_backend.is_helion():
-            raise ValueError(
-                "The Helion linear-attention backend supports KDA only, not GDN."
-            )
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel. An explicitly configured verify backend wins; the
-        # historical auto rule (FlashInfer when the selected FlashInfer kernel
-        # supports MTP verify) only applies when no explicit choice was made.
-        # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
-        # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
-        if verify_backend is not None and verify_backend.is_triton():
-            self.verify_kernel = triton_kernel
-            self.verify_kernel_is_flashinfer = False
-        elif (
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
+        if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
@@ -365,10 +345,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        backends = model_runner.linear_attn_backends
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
-        )
+        decode_backend = get_linear_attn_decode_backend()
+        prefill_backend = get_linear_attn_prefill_backend()
+        self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -379,8 +358,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if _GDN_SKIP_EVERY > 0:
-            _GDN_STEP_COUNTER[0] += 1
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
@@ -409,9 +386,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
-            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
-
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -430,16 +404,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        # ours: stride-N decode experiment — on skipped steps the kernel still
-        # runs but the slot state is restored afterwards (write discarded, so
-        # the next step reads the previous state). Requires eager mode.
-        _ours_skip = (
-            _GDN_SKIP_EVERY > 0
-            and _GDN_STEP_COUNTER[0] % _GDN_SKIP_EVERY == 1
-        )
-        if _ours_skip:
-            _ours_saved_ssm = ssm_states[cache_indices].clone()
-            _ours_saved_conv = conv_states[cache_indices].clone()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -452,13 +416,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
-            from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
-                gdn_beta_scale,
-                gdn_decay_enabled,
-                gdn_decay_flag,
-                gdn_gscale,
-            )
-
             core_attn_out = self.kernel_dispatcher.packed_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -470,17 +427,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
-                gdn_decay_flag=(
-                    gdn_decay_flag(ssm_states.device) if gdn_decay_enabled() else None
-                ),
-                gdn_gscale=(
-                    gdn_gscale(ssm_states.device) if gdn_decay_enabled() else None
-                ),
-                gdn_beta_scale=(
-                    gdn_beta_scale(ssm_states.device)
-                    if gdn_decay_enabled()
-                    else None
-                ),
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
@@ -520,10 +466,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
-        if _ours_skip:
-            ssm_states[cache_indices] = _ours_saved_ssm
-            conv_states[cache_indices] = _ours_saved_conv
-
         return core_attn_out
 
     def forward_extend(
@@ -537,9 +479,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
-
-        if _is_hip and seq_len == 0:
-            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
@@ -761,6 +700,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
+
+            # [billion-context-GDN E2] Lazy SVD truncation at the chunk
+            # boundary: keep the top-r singular components of each head's
+            # recurrent state. Singular magnitudes carry the model's own
+            # importance signal (beta-gated write energy accumulated by the
+            # delta rule), so this compresses-once-and-keeps-long instead of
+            # decaying everything away each step. Env-gated, default off.
+            _svd_rank = int(os.environ.get("SGLANG_GDN_SVD_RANK", "0") or 0)
+            if _svd_rank > 0:
+                _idx = cache_indices
+                _S = ssm_states[_idx].float()
+                _orig_shape = _S.shape
+                _M = _S.reshape(-1, _orig_shape[-2], _orig_shape[-1])
+                _U, _sig, _Vh = torch.linalg.svd(_M, full_matrices=False)
+                _r = min(_svd_rank, _sig.shape[-1])
+                _S2 = (_U[..., :_r] * _sig[..., :_r].unsqueeze(-2)) @ _Vh[..., :_r, :]
+                ssm_states[_idx] = _S2.reshape(_orig_shape).to(ssm_states.dtype)
 
         return core_attn_out
 

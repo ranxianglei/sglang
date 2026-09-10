@@ -72,4 +72,11 @@ def fused_gdn_gating(
         8,
         num_warps=1,
     )
+    # [billion-context-GDN experiment] gamma floor: g is log-space decay (gamma=exp(g)<1).
+    # clamp so gamma >= floor => old state memory decays no faster than floor per token.
+    # Disabled by default (SGLANG_GDN_GAMMA_FLOOR unset/0). Does not touch beta or delta rule.
+    import os as _os, math as _math
+    _floor = float(_os.environ.get('SGLANG_GDN_GAMMA_FLOOR', '0') or 0)
+    if _floor > 0:
+        g = g.clamp_min(_math.log(_floor))
     return g, beta_output
