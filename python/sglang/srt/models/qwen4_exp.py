@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -1422,6 +1423,17 @@ class Qwen4ExpLinearDecoderLayer(
             else:
                 gdn_cov_accum(self.layer_id, hidden_states)
                 hidden_states = self.linear_attn(hidden_states, forward_batch)
+                if os.environ.get("SGLANG_GDN_DEBUG_NAN"):
+                    _bad = torch.isnan(hidden_states).any().item()
+                    _mx = hidden_states.abs().max().item()
+                    print(
+                        f"GDN_DEBUG layer={self.layer_id} nan={_bad} absmax={_mx:.3e}",
+                        flush=True,
+                    )
+                    if _bad or _mx > 1e4:
+                        hidden_states = torch.nan_to_num(
+                            hidden_states, nan=0.0, posinf=0.0, neginf=0.0
+                        )
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
             hidden_states, residual, forward_batch
