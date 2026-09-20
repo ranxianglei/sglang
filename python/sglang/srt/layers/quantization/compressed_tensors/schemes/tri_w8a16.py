@@ -35,8 +35,17 @@ _SPLITK_CONFIGS = [
     (32, 64, 128, 4),
     (16, 128, 64, 8),
 ]
+# Small-M candidates that use the plain large kernel (BM covers M, grid = cdiv(N,BN)):
+# for bandwidth-bound decode these avoid split-K fp32 atomic contention on some shapes.
+_DIRECT_CONFIGS = [
+    (32, 64, 128, 4, 3),
+    (32, 64, 128, 4, 4),
+    (32, 128, 128, 4, 3),
+    (16, 64, 128, 4, 3),
+]
 _LARGE_CFG = {}   # (N, K) -> tuple from _LARGE_CONFIGS
-_SPLITK_CFG = {}  # (N, K) -> tuple from _SPLITK_CONFIGS
+# (N, K) -> ("splitk", (BM,BN,BK,warps), SPLIT_K) or ("direct", (BM,BN,BK,warps,stages))
+_SPLITK_CFG = {}
 
 
 @triton.jit
@@ -155,10 +164,13 @@ def w8a16_gemm_splitk(a_bf16, w_u8, scales, bias=None, cfg=None):
     M, K = a_bf16.shape
     N = w_u8.shape[0]
     if cfg is None:
-        cfg = _SPLITK_CFG.get((N, K), _SPLITK_CONFIGS[0])
-    BM, BN, BK, nw = cfg
+        cfg = _SPLITK_CFG.get((N, K), ("splitk", _SPLITK_CONFIGS[0], 4))
+    if cfg[0] == "direct":
+        return w8a16_gemm(a_bf16, w_u8, scales, bias, cfg=cfg[1])
+    kind, c, sk = cfg
+    BM, BN, BK, nw = c
     c32 = torch.zeros((M, N), dtype=torch.float32, device=a_bf16.device)
-    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), 4)
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), sk)
     _w8a16_gemm_splitk_kernel[grid](
         a_bf16, w_u8, scales, c32, M, N, K,
         a_bf16.stride(0), a_bf16.stride(1),
@@ -166,7 +178,7 @@ def w8a16_gemm_splitk(a_bf16, w_u8, scales, bias=None, cfg=None):
         scales.stride(0),
         c32.stride(0), c32.stride(1),
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
-        GROUP_K=128, SPLIT_K=4, num_warps=nw,
+        GROUP_K=128, SPLIT_K=sk, num_warps=nw,
     )
     out = c32.to(a_bf16.dtype)
     if bias is not None:
@@ -182,35 +194,73 @@ def w8a16_linear(a_bf16, w_u8, scales, bias=None, splitk_threshold=128):
 
 def _select_config(w_u8, scales, configs, kind, m_probe):
     """Time each config AND validate its output against a dequant reference.
-    Only validated configs are eligible; fastest wins. Runs once per (N,K) at load."""
+    Only validated configs are eligible; fastest wins. Runs once per (N,K) at load.
+    Decode-side timing is L2-flushed (rotating scratch read between reps) so the
+    choice reflects production DRAM-bound conditions, not L2-hot flattery."""
     N, K = w_u8.shape
     torch.manual_seed(0)
     a = (torch.randn(m_probe, K, device=w_u8.device) * 0.5).to(torch.bfloat16)
     w_deq = ((w_u8.to(torch.float32) - 128.0)
              * scales.repeat_interleave(128, dim=1).to(torch.float32)).to(torch.bfloat16)
     ref = (a.float() @ w_deq.float().T)
+    del w_deq
     ref_scale = ref.abs().max().item() + 1e-6
-    fn = w8a16_gemm if kind == "large" else w8a16_gemm_splitk
-    best, best_t = None, float("inf")
-    for cfg in configs:
+    flush = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=w_u8.device)
+    import time as _t
+
+    def timed(fn, cfg, flush_between):
         try:
             out = fn(a, w_u8, scales, cfg=cfg)
             rel = (out.float() - ref).abs().max().item() / ref_scale
             if rel > 5e-3:
-                continue  # invalid: skip (never select)
+                return None  # invalid: skip (never select)
             for _ in range(3):
                 fn(a, w_u8, scales, cfg=cfg)
             torch.cuda.synchronize()
-            import time as _t
             t0 = _t.time()
             for _ in range(10):
+                if flush_between:
+                    flush.sum()
                 fn(a, w_u8, scales, cfg=cfg)
             torch.cuda.synchronize()
-            t = _t.time() - t0
-            if t < best_t:
-                best, best_t = cfg, t
+            return _t.time() - t0
         except Exception:
-            continue  # e.g. SMEM overflow on this shape: skip
+            return None  # e.g. SMEM overflow on this shape: skip
+
+    if kind == "large":
+        best, best_t = None, float("inf")
+        for cfg in configs:
+            t = timed(w8a16_gemm, cfg, flush_between=False)
+            if t is not None and t < best_t:
+                best, best_t = cfg, t
+        return best
+
+    best, best_t = None, float("inf")
+    t_flush = None
+    for c in _SPLITK_CONFIGS:
+        for sk in (4, 8):
+            t = timed(w8a16_gemm_splitk, ("splitk", c, sk), flush_between=True)
+            if t is None:
+                continue
+            if t_flush is None:
+                torch.cuda.synchronize(); t0 = _t.time()
+                for _ in range(10):
+                    flush.sum()
+                torch.cuda.synchronize(); t_flush = _t.time() - t0
+            if t - t_flush < best_t:
+                best, best_t = ("splitk", c, sk), t - t_flush
+    for c in _DIRECT_CONFIGS:
+        t = timed(lambda x, w, s, cfg=None: w8a16_gemm(x, w, s, None, c), None, flush_between=True)
+        if t is None:
+            continue
+        if t_flush is None:
+            torch.cuda.synchronize(); t0 = _t.time()
+            for _ in range(10):
+                flush.sum()
+            torch.cuda.synchronize(); t_flush = _t.time() - t0
+        if t - t_flush < best_t:
+            best, best_t = ("direct", c), t - t_flush
+    del flush
     return best
 
 
