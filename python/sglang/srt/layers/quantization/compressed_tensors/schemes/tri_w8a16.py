@@ -6,22 +6,39 @@ Weight layout (compressed-tensors wNa16, little-endian int32 packing):
   dequant: w = (u8 - 128) * scale[n, k//128]
 
 Kernel keeps weights as int8 in HBM; dequantizes in registers; tl.dot on bf16.
-BLOCK_K == 128 == group_size -> one scale per k-iteration, no gather.
+BLOCK_K <= 128 == group_size -> at most one scale per k-iteration boundary (BK=128: exact).
+
+DETERMINISM DESIGN (post-incident):
+  No @triton.autotune anywhere. Config selection happens ONCE at weight-load time in
+  warm_w8a16(): each candidate config is timed AND output-validated against a dequant
+  reference; the fastest VALID config is pinned per (N, K). Launchers compute the grid
+  from the pinned config's own tile sizes, so every config is structurally correct for
+  any (M, N) — no reliance on over-coverage luck.
 """
 import torch
 import triton
 import triton.language as tl
 
 
-_CONFIGS = [
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+# (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) — large-M (prefill) candidates.
+# All are structurally safe because the launcher derives the grid from BM/BN.
+_LARGE_CONFIGS = [
+    (128, 128, 64, 8, 4),
+    (128, 256, 64, 8, 3),
+    (256, 128, 64, 8, 2),
+    (64, 256, 128, 8, 2),
 ]
+# (BLOCK_M, BLOCK_N, BLOCK_K, num_warps) — small-M split-K (decode) candidates.
+_SPLITK_CONFIGS = [
+    (16, 64, 128, 4),
+    (16, 128, 128, 4),
+    (32, 64, 128, 4),
+    (16, 128, 64, 8),
+]
+_LARGE_CFG = {}   # (N, K) -> tuple from _LARGE_CONFIGS
+_SPLITK_CFG = {}  # (N, K) -> tuple from _SPLITK_CONFIGS
 
 
-@triton.autotune(configs=_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _w8a16_gemm_kernel(
     A, W, S, C,
@@ -44,7 +61,6 @@ def _w8a16_gemm_kernel(
 
     a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     w_ptrs = W + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
-    n_groups = K // GROUP_K
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     m_mask = offs_m[:, None] < M
@@ -65,12 +81,14 @@ def _w8a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
-def w8a16_gemm(a_bf16, w_u8, scales, bias=None):
+def w8a16_gemm(a_bf16, w_u8, scales, bias=None, cfg=None):
     """a: [M,K] bf16; w_u8: [N,K] uint8 (b128-encoded); scales: [N, K//128] bf16."""
     M, K = a_bf16.shape
     N = w_u8.shape[0]
+    if cfg is None:
+        cfg = _LARGE_CFG.get((N, K), _LARGE_CONFIGS[0])
+    BM, BN, BK, nw, ns = cfg
     c = torch.empty((M, N), dtype=torch.bfloat16, device=a_bf16.device)
-    BM, BN = 128, 128
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
     _w8a16_gemm_kernel[grid](
         a_bf16, w_u8, scales, c, M, N, K,
@@ -78,23 +96,14 @@ def w8a16_gemm(a_bf16, w_u8, scales, bias=None):
         w_u8.stride(0), w_u8.stride(1),
         scales.stride(0),
         c.stride(0), c.stride(1),
-        GROUP_K=128,
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+        GROUP_K=128, num_warps=nw, num_stages=ns,
     )
     if bias is not None:
         c += bias
     return c
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8),
-    ],
-    key=["N", "K"],
-    reset_to_zero=["C"],
-)
 @triton.jit
 def _w8a16_gemm_splitk_kernel(
     A, W, S, C,
@@ -142,11 +151,13 @@ def _w8a16_gemm_splitk_kernel(
                   acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
-def w8a16_gemm_splitk(a_bf16, w_u8, scales, bias=None):
+def w8a16_gemm_splitk(a_bf16, w_u8, scales, bias=None, cfg=None):
     M, K = a_bf16.shape
     N = w_u8.shape[0]
+    if cfg is None:
+        cfg = _SPLITK_CFG.get((N, K), _SPLITK_CONFIGS[0])
+    BM, BN, BK, nw = cfg
     c32 = torch.zeros((M, N), dtype=torch.float32, device=a_bf16.device)
-    BM, BN = 16, 64
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), 4)
     _w8a16_gemm_splitk_kernel[grid](
         a_bf16, w_u8, scales, c32, M, N, K,
@@ -154,7 +165,8 @@ def w8a16_gemm_splitk(a_bf16, w_u8, scales, bias=None):
         w_u8.stride(0), w_u8.stride(1),
         scales.stride(0),
         c32.stride(0), c32.stride(1),
-        GROUP_K=128, SPLIT_K=4,
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+        GROUP_K=128, SPLIT_K=4, num_warps=nw,
     )
     out = c32.to(a_bf16.dtype)
     if bias is not None:
@@ -166,6 +178,58 @@ def w8a16_linear(a_bf16, w_u8, scales, bias=None, splitk_threshold=128):
     if a_bf16.shape[0] < splitk_threshold:
         return w8a16_gemm_splitk(a_bf16, w_u8, scales, bias)
     return w8a16_gemm(a_bf16, w_u8, scales, bias)
+
+
+def _select_config(w_u8, scales, configs, kind, m_probe):
+    """Time each config AND validate its output against a dequant reference.
+    Only validated configs are eligible; fastest wins. Runs once per (N,K) at load."""
+    N, K = w_u8.shape
+    torch.manual_seed(0)
+    a = (torch.randn(m_probe, K, device=w_u8.device) * 0.5).to(torch.bfloat16)
+    w_deq = ((w_u8.to(torch.float32) - 128.0)
+             * scales.repeat_interleave(128, dim=1).to(torch.float32)).to(torch.bfloat16)
+    ref = (a.float() @ w_deq.float().T)
+    ref_scale = ref.abs().max().item() + 1e-6
+    fn = w8a16_gemm if kind == "large" else w8a16_gemm_splitk
+    best, best_t = None, float("inf")
+    for cfg in configs:
+        try:
+            out = fn(a, w_u8, scales, cfg=cfg)
+            rel = (out.float() - ref).abs().max().item() / ref_scale
+            if rel > 5e-3:
+                continue  # invalid: skip (never select)
+            for _ in range(3):
+                fn(a, w_u8, scales, cfg=cfg)
+            torch.cuda.synchronize()
+            import time as _t
+            t0 = _t.time()
+            for _ in range(10):
+                fn(a, w_u8, scales, cfg=cfg)
+            torch.cuda.synchronize()
+            t = _t.time() - t0
+            if t < best_t:
+                best, best_t = cfg, t
+        except Exception:
+            continue  # e.g. SMEM overflow on this shape: skip
+    return best
+
+
+def warm_w8a16(w_u8, w_scale):
+    """Load-time deterministic config selection + kernel compile warmup.
+    Call before CUDA graph capture; afterwards launches are fixed-config."""
+    key = (w_u8.shape[0], w_u8.shape[1])
+    cfg = _select_config(w_u8, w_scale, _LARGE_CONFIGS, "large", m_probe=4096)
+    if cfg is not None:
+        _LARGE_CFG[key] = cfg
+    cfg = _select_config(w_u8, w_scale, _SPLITK_CONFIGS, "splitk", m_probe=8)
+    if cfg is not None:
+        _SPLITK_CFG[key] = cfg
+    a = torch.zeros((8, w_u8.shape[1]), dtype=torch.bfloat16, device=w_u8.device)
+    w8a16_linear(a, w_u8, w_scale)
+    a = torch.zeros((4096, w_u8.shape[1]), dtype=torch.bfloat16, device=w_u8.device)
+    w8a16_linear(a, w_u8, w_scale)
+    torch.cuda.synchronize()
+    return _LARGE_CFG.get(key), _SPLITK_CFG.get(key)
 
 
 def make_qa(n, k, group=128, device="cuda"):
@@ -183,12 +247,6 @@ def make_qa(n, k, group=128, device="cuda"):
     return a, w_q, scales, w
 
 
-def warm_w8a16(w_u8, w_scale):
-    for m in (8, 72, 4096):
-        a = torch.zeros((m, w_u8.shape[1]), dtype=torch.bfloat16, device=w_u8.device)
-        w8a16_linear(a, w_u8, w_scale)
-    torch.cuda.synchronize()
-
 if __name__ == "__main__":
     import time
     dev = "cuda"
@@ -201,6 +259,8 @@ if __name__ == "__main__":
     M = 4096
     for n, k, name in shapes:
         a, w_q, scales, w_ref = make_qa(n, k)
+        large_cfg, splitk_cfg = warm_w8a16(w_q, scales)
+        print(f"{name}: pinned large={large_cfg} splitk={splitk_cfg}")
         out = w8a16_gemm(a, w_q, scales)
         w_deq = ((w_q.to(torch.float32) - 128.0) * scales.repeat_interleave(128, dim=1)).to(torch.bfloat16)
         ref = (a @ w_deq.T)
