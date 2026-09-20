@@ -39,7 +39,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 
@@ -89,6 +89,28 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.quant_type = (WNA16_ZP_SUPPORTED_TYPES_MAP[num_bits]
                            if not self.symmetric else
                            WNA16_SUPPORTED_TYPES_MAP[num_bits])
+
+        # SGLANG_WNA16_NATIVE_BF16=1: dequantize weights to bf16 at load and
+        # use cuBLAS GEMM instead of Marlin (which is decode-optimized and
+        # wastes ~half the tensor-core throughput at prefill M>=1k). Cost:
+        # weights double in size (KV pool shrinks). Numerics identical.
+        self.native_bf16 = get_bool_env_var("SGLANG_WNA16_NATIVE_BF16")
+        if self.native_bf16:
+            assert self.symmetric, (
+                "SGLANG_WNA16_NATIVE_BF16 requires symmetric quantization")
+            assert not self.has_g_idx, (
+                "SGLANG_WNA16_NATIVE_BF16 does not support actorder/g_idx")
+
+        # SGLANG_WNA16_TRITON=1: keep weights as int8 (uint8b128 packed) and
+        # run a custom triton mixed-input GEMM (dequant-on-the-fly, fp32
+        # accumulate). Prefill-path GEMM reaches 2-2.5x Marlin throughput
+        # while decode still streams int8 weights (no KV/memory cost).
+        self.triton_mixed = get_bool_env_var("SGLANG_WNA16_TRITON")
+        if self.triton_mixed:
+            assert self.symmetric, (
+                "SGLANG_WNA16_TRITON requires symmetric quantization")
+            assert not self.has_g_idx, (
+                "SGLANG_WNA16_TRITON does not support actorder/g_idx")
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -215,6 +237,13 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.w_zp_name = "weight_zero_point"
         self.w_gidx_name = "weight_g_idx"
 
+        if self.native_bf16:
+            self._process_weights_native_bf16(layer)
+            return
+        if self.triton_mixed:
+            self._process_weights_triton(layer)
+            return
+
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
@@ -301,8 +330,77 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
 
+    def _process_weights_native_bf16(self, layer: torch.nn.Module) -> None:
+        w_q = getattr(layer, self.w_q_name).data
+        w_s = getattr(layer, self.w_s_name).data
+        device = w_q.device
+        n = w_q.shape[0]
+        k = w_q.shape[1] * self.pack_factor
+        g = self.group_size
+        w = torch.empty(n, k, dtype=torch.bfloat16, device=device)
+        chunk = max(1, (1 << 28) // max(k, 1))
+        for i in range(0, n, chunk):
+            j = min(i + chunk, n)
+            t = (
+                w_q[i:j].contiguous().view(torch.uint8)[:, :k]
+                .to(torch.bfloat16)
+                .sub_(128.0)
+            )
+            if g == -1:
+                w[i:j].copy_(t.mul_(w_s[i:j].to(torch.bfloat16)))
+            else:
+                t = t.view(j - i, k // g, g).mul_(
+                    w_s[i:j].to(torch.bfloat16).unsqueeze(-1)
+                )
+                w[i:j].copy_(t.view(j - i, k))
+        layer.weight_native = w
+        replace_parameter(
+            layer,
+            self.w_q_name,
+            torch.nn.Parameter(
+                torch.empty(0, dtype=torch.int32, device=device),
+                requires_grad=False,
+            ),
+        )
+
+    def _process_weights_triton(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.tri_w8a16 import (
+            warm_w8a16,
+        )
+        w_q = getattr(layer, self.w_q_name).data
+        w_s = getattr(layer, self.w_s_name).data
+        n = w_q.shape[0]
+        k = w_q.shape[1] * self.pack_factor
+        g = self.group_size if self.group_size != -1 else k
+        w_u8 = w_q.contiguous().view(torch.uint8)[:, :k]
+        scale = w_s.to(torch.bfloat16) if w_s.dtype != torch.bfloat16 else w_s
+        if scale.shape[1] == 1:
+            scale = scale.expand(-1, k // g).contiguous()
+        else:
+            scale = scale.contiguous()
+        layer.w_u8 = w_u8
+        layer.w_scale = scale
+        replace_parameter(
+            layer,
+            self.w_q_name,
+            torch.nn.Parameter(
+                torch.empty(0, dtype=torch.int32, device=w_q.device),
+                requires_grad=False,
+            ),
+        )
+        warm_w8a16(layer.w_u8, layer.w_scale)
+
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.native_bf16:
+            return torch.nn.functional.linear(x, layer.weight_native, bias)
+        if self.triton_mixed:
+            from sglang.srt.layers.quantization.compressed_tensors.schemes.tri_w8a16 import (
+                w8a16_linear,
+            )
+            x2 = x.reshape(-1, x.shape[-1])
+            out = w8a16_linear(x2, layer.w_u8, layer.w_scale, bias)
+            return out.reshape(*x.shape[:-1], out.shape[-1])
         c = self.kernel_config
 
         def _get_weight_params(
