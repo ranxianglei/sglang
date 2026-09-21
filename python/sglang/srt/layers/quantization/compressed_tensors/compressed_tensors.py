@@ -895,6 +895,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Note: NPU devices do not support min_capability function
         if not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
+        try:
+            scheme.layer_name = layer_name or ""
+        except Exception:
+            pass
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 

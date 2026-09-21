@@ -3,6 +3,7 @@
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import re as _re
 from typing import Callable, Optional
 
 import torch
@@ -48,6 +49,22 @@ if _is_cuda:
 
 
 ScalarType, scalar_types = get_scalar_types()
+
+# GDN (linear_attn) projections are recurrent-state writers: dequant noise
+# compounds over context. Env routes them back to the exact Marlin numerics
+# while MLP/attn keep the fast path.
+_GDN_PATTERN = None
+_GDN_PATTERN_INIT = False
+
+
+def _gdn_marlin_pattern():
+    global _GDN_PATTERN, _GDN_PATTERN_INIT
+    if not _GDN_PATTERN_INIT:
+        _GDN_PATTERN_INIT = True
+        if get_bool_env_var("SGLANG_WNA16_GDN_MARLIN"):
+            _GDN_PATTERN = _re.compile(r"linear_attn\.(in_proj_qkv|in_proj_z|out_proj)")
+    return _GDN_PATTERN
+
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +257,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         if self.native_bf16:
             self._process_weights_native_bf16(layer)
             return
-        if self.triton_mixed:
+        gdn_pat = _gdn_marlin_pattern()
+        gdn_marlin = bool(
+            gdn_pat is not None
+            and gdn_pat.search(getattr(self, "layer_name", "") or "")
+        )
+        if gdn_marlin:
+            layer._wna16_gdn_marlin = True
+        if self.triton_mixed and not gdn_marlin:
             self._process_weights_triton(layer)
             return
 
@@ -378,8 +402,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             scale = scale.expand(-1, k // g).contiguous()
         else:
             scale = scale.contiguous()
-        layer.w_u8 = w_u8
-        layer.w_scale = scale
+        layer.w_u8 = w_u8.t().contiguous()
+        layer.w_scale = scale.t().contiguous()
+        w_u8 = None
+        scale = None
         replace_parameter(
             layer,
             self.w_q_name,
@@ -392,9 +418,11 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
-        if self.native_bf16:
+        if getattr(layer, "_wna16_gdn_marlin", False):
+            pass
+        elif self.native_bf16:
             return torch.nn.functional.linear(x, layer.weight_native, bias)
-        if self.triton_mixed:
+        elif self.triton_mixed:
             from sglang.srt.layers.quantization.compressed_tensors.schemes.tri_w8a16 import (
                 w8a16_linear,
             )
