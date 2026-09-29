@@ -692,9 +692,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+        from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+            gdn_qkvz_cache,
+            gdn_reuse_enabled,
+            gdn_reuse_is_skip,
         )
+
+        _reuse_idx = None
+        if gdn_reuse_enabled() and forward_batch.forward_mode.is_decode():
+            try:
+                from sglang.srt.layers.attention import get_attn_backend
+
+                _backend = get_attn_backend()
+                _reuse_idx = _backend.forward_metadata.mamba_cache_indices
+            except Exception:
+                _reuse_idx = None
+
+        if _reuse_idx is not None and gdn_reuse_is_skip():
+            _cache = gdn_qkvz_cache(
+                self.layer_id,
+                _backend.req_to_token_pool.mamba2_layer_cache(self.layer_id).temporal.shape[0],
+                self.in_proj_qkvz.weight.shape[0],
+                hidden_states.device,
+                hidden_states.dtype,
+            )
+            projected_states_qkvz = _cache.index_select(0, _reuse_idx)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        else:
+            projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+                hidden_states
+            )
+            if _reuse_idx is not None:
+                _cache = gdn_qkvz_cache(
+                    self.layer_id,
+                    _backend.req_to_token_pool.mamba2_layer_cache(self.layer_id).temporal.shape[0],
+                    projected_states_qkvz.shape[-1],
+                    hidden_states.device,
+                    projected_states_qkvz.dtype,
+                )
+                _cache.index_copy_(0, _reuse_idx, projected_states_qkvz)
 
         if (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS

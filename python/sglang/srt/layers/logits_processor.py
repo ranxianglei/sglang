@@ -279,6 +279,40 @@ class LogitsMetadata:
         )
 
 
+_OURS_LMHEAD_STATE = None
+
+
+def _ours_lmhead_state(lm_head):
+    global _OURS_LMHEAD_STATE
+    if _OURS_LMHEAD_STATE is None:
+        import os, json
+
+        path = os.environ.get("SGLANG_LMHEAD_HOT_TOKENS", "")
+        if not path:
+            _OURS_LMHEAD_STATE = ("off", None, None, None)
+            return _OURS_LMHEAD_STATE
+        hot_ids = json.load(open(path))["hot_ids"]
+        w = lm_head.weight
+        hot = torch.tensor(sorted(hot_ids), dtype=torch.long, device=w.device)
+        crop = os.environ.get("SGLANG_LMHEAD_HOT_CROP", "") == "1"
+        if crop:
+            hot_w = w.data[hot].contiguous()
+            bias = None
+        else:
+            hot_w = None
+            bias = torch.zeros(w.shape[0], dtype=w.dtype, device=w.device)
+            bias.fill_(float("-inf"))
+            bias[hot] = 0.0
+        _OURS_LMHEAD_STATE = ("crop" if crop else "mask", hot_w, hot, bias)
+        logger.info(
+            "[LMHEAD-HOT] mode=%s hot=%d vocab=%d",
+            "crop" if crop else "mask",
+            len(hot_ids),
+            w.shape[0],
+        )
+    return _OURS_LMHEAD_STATE
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -663,6 +697,10 @@ class LogitsProcessor(nn.Module):
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
+        _ours_mode, _, _, _ours_bias = _ours_lmhead_state(lm_head)
+        if _ours_mode == "mask":
+            logits.add_(_ours_bias)
+
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
@@ -697,6 +735,19 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
+        _ours_mode, _ours_hot_w, _ours_hot, _ours_bias = _ours_lmhead_state(lm_head)
+        if _ours_mode == "crop":
+            hot_logits = torch.matmul(
+                hidden_states, _ours_hot_w.t().to(hidden_states.dtype)
+            )
+            logits = torch.full(
+                (hidden_states.shape[0], lm_head.weight.shape[0]),
+                float("-inf"),
+                dtype=hot_logits.dtype,
+                device=hot_logits.device,
+            )
+            logits[:, _ours_hot] = hot_logits
+            return logits
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)

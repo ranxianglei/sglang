@@ -57,6 +57,10 @@ Hardware floor: 96GB VRAM + ≥64GB free host RAM (PLE is pinned to host). Model
   FusedMoE pool shrinks to the keep set and top-k ids are remapped to pool slots.
 - **Verified** (Qwen3.8-Flash-Next W4A16 512→296, 1×96GB): GPU weights -13GB, KV pool +31%,
   single-stream parity (100.6 tok/s), quality gate green, anomaly self-heal 5/5.
+- **Two modes**: mask-only (just `KEEP_MASK`) loads the full pool to GPU — masked experts sit
+  idle but warm; useful for fast keep-set sweeps (hot bias edits, no restart). Adding
+  `KEEP_OFFLOAD=1` is the **production form**: non-kept experts never touch GPU (host-pinned),
+  weights 58→44.9GB, KV pool 655K→855K tokens; swap keep sets via json + 3-min restart.
 - Pipeline to reproduce the keep set on your own traffic: **[ranxianglei/sglang-expert-profile](https://github.com/ranxianglei/sglang-expert-profile)** (standalone project — profile recorder CLI + community keep-set seeds: daily-294 / daily-heal-296); quick pipeline also in `tools/expert-tools/` (profile → make_keep → serve → re-slice).
 
 ### 4. (WIP, not for upstream yet) cold-expert dynamic staging

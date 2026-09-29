@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -422,6 +423,12 @@ class TopK(BaseFusedOp):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
         super().__init__()
+
+        # ours: runtime top-k override for experiments (e.g. wider-than-trained k)
+        _env_topk = int(os.environ.get("SGLANG_EXPERT_TOPK", "0") or 0)
+        if _env_topk > 0:
+            logger.info("[EXPERT-TOPK] overriding top_k %s -> %s", top_k, _env_topk)
+            top_k = _env_topk
 
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None

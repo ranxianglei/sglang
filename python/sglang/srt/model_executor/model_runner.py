@@ -1509,6 +1509,15 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        if forward_batch.forward_mode.is_decode():
+            from sglang.srt.layers.attention.linear.gdn_skip_ctx import (
+                gdn_decay_tick,
+                gdn_step_begin,
+            )
+
+            gdn_step_begin()
+            gdn_decay_tick(self.device)
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
